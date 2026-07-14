@@ -80,7 +80,8 @@ create_gh_stub() {
     {"body":"<!-- ops:start -->\nWORKER_BRANCH_ORPHAN branch=feature/other session=issue-100 ts=${now_iso}\n<!-- ops:end -->"},
     {"body":"<!-- ops:start -->\nWORKER_BRANCH_ORPHAN branch=feature/missing session=issue-100 ts=${now_iso}\n<!-- ops:end -->"},
     {"body":"<!-- ops:start -->\nWORKER_BRANCH_ORPHAN branch=feature/empty session=issue-100 ts=${now_iso}\n<!-- ops:end -->"},
-    {"body":"<!-- ops:start -->\nWORKER_BRANCH_ORPHAN branch=feature/empty-pr session=issue-100 ts=${now_iso}\n<!-- ops:end -->"}
+    {"body":"<!-- ops:start -->\nWORKER_BRANCH_ORPHAN branch=feature/empty-pr session=issue-100 ts=${now_iso}\n<!-- ops:end -->"},
+    {"body":"<!-- ops:start -->\nWORKER_BRANCH_ORPHAN branch=feature/empty-no-delete session=issue-100 ts=${now_iso}\n<!-- ops:end -->"}
   ]
 ]
 EOF
@@ -108,6 +109,10 @@ set -euo pipefail
 
 if [[ "${1:-}" == "api" ]]; then
 	if [[ "$*" == *" -X DELETE "* ]]; then
+		# GH#1214: simulate branch protection preventing DELETE
+		if [[ "$*" == *"feature/empty-no-delete"* ]]; then
+			exit 1
+		fi
 		printf '%s\n' "$*" >>"${TEST_ROOT}/deleted-refs.log"
 		exit 0
 	fi
@@ -133,7 +138,7 @@ if [[ "${1:-}" == "api" ]]; then
 fi
 
 if [[ "${1:-}" == "pr" && "${2:-}" == "list" ]]; then
-	if [[ "$*" == *"--head feature/empty "* ]]; then
+	if [[ "$*" == *"--head feature/empty "* || "$*" == *"--head feature/empty-no-delete "* ]]; then
 		exit 0
 	fi
 	if [[ "$*" == *"owner/develop-repo"* ]]; then
@@ -185,7 +190,7 @@ fi
 
 if [[ "${1:-}" == "rev-list" && "${2:-}" == "--count" ]]; then
 	case "${3:-}" in
-		origin/main..origin/feature/empty|origin/feature/empty|origin/main..origin/feature/empty-pr|origin/feature/empty-pr)
+		origin/main..origin/feature/empty|origin/feature/empty|origin/main..origin/feature/empty-pr|origin/feature/empty-pr|origin/main..origin/feature/empty-no-delete|origin/feature/empty-no-delete)
 			printf '0\n'
 			;;
 		*)
@@ -272,16 +277,17 @@ test_orphan_comment_without_remote_branch_blocks_immediately() {
 }
 
 test_orphan_comment_with_zero_commits_auto_recovers() {
-	local output=""
-	if output=$("$HELPER_SCRIPT" check-orphan-loop 100 owner/repo feature/empty "" "${TEST_ROOT}/wt-zero-commits" 2>/dev/null); then
-		if [[ "$output" == *"WORKER_BRANCH_ORPHAN_AUTO_RECOVERED"* ]] && grep -q -- "feature/empty" "${TEST_ROOT}/deleted-refs.log" && grep -q -- "worker-branch-orphan-auto-recovered" "${TEST_ROOT}/posts/100.argv"; then
-			print_result "orphan marker with zero remote branch commits auto-recovers" 0
-			return 0
-		fi
-		print_result "orphan marker with zero remote branch commits auto-recovers" 1 "Output/post missing auto-recovery evidence: ${output}"
+	# GH#1214: after the return-value fix, auto-recovery causes
+	# check-orphan-loop to exit 1 (not held) instead of exit 0.
+	local output="" rc=0
+	output=$("$HELPER_SCRIPT" check-orphan-loop 100 owner/repo feature/empty "" "${TEST_ROOT}/wt-zero-commits" 2>/dev/null) || rc=$?
+	if [[ "$rc" -ne 0 && "$output" == *"WORKER_BRANCH_ORPHAN_AUTO_RECOVERED"* ]] && \
+	   grep -q -- "feature/empty" "${TEST_ROOT}/deleted-refs.log" && \
+	   grep -q -- "worker-branch-orphan-auto-recovered" "${TEST_ROOT}/posts/100.argv"; then
+		print_result "orphan marker with zero remote branch commits auto-recovers (not held)" 0
 		return 0
 	fi
-	print_result "orphan marker with zero remote branch commits auto-recovers" 1 "Expected auto-recovery result"
+	print_result "orphan marker with zero remote branch commits auto-recovers (not held)" 1 "rc=${rc}, output: ${output}"
 	return 0
 }
 
@@ -299,6 +305,21 @@ test_zero_commit_branch_with_pr_still_holds() {
 	return 0
 }
 
+# GH#1214 regression test: when DELETE fails due to branch protection or
+# permission but the branch has zero commits and no PR, dispatch should
+# pass through instead of blocking with UNRECOVERABLE_BLOCKED. This
+# prevents the no_work circuit breaker loop via stale-recovery.
+test_zero_commit_delete_fails_passes_through() {
+	local output="" rc=0
+	output=$("$HELPER_SCRIPT" check-orphan-loop 100 owner/repo feature/empty-no-delete "" "${TEST_ROOT}/wt-zero-commits" 2>/dev/null) || rc=$?
+	if [[ "$rc" -ne 0 && "$output" == *"WORKER_BRANCH_ORPHAN_ZERO_COMMIT_PASSTHROUGH"* ]]; then
+		print_result "zero-commit orphan with DELETE failure passes through (GH#1214)" 0
+		return 0
+	fi
+	print_result "zero-commit orphan with DELETE failure passes through (GH#1214)" 1 "rc=${rc}, output: ${output}"
+	return 0
+}
+
 main() {
 	setup_test_env
 	test_same_issue_branch_blocks_and_posts_diagnostic
@@ -309,6 +330,7 @@ main() {
 	test_orphan_comment_without_remote_branch_blocks_immediately
 	test_orphan_comment_with_zero_commits_auto_recovers
 	test_zero_commit_branch_with_pr_still_holds
+	test_zero_commit_delete_fails_passes_through
 	teardown_test_env
 
 	printf '\nTests run: %d\n' "$TESTS_RUN"

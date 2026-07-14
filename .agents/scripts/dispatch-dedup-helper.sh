@@ -227,9 +227,16 @@ _ddh_hold_unrecoverable_orphan_branch() {
 #######################################
 # Auto-recover a provably disposable zero-commit orphan branch.
 #
+# When the remote branch has zero commits ahead of base and no PR references
+# it, try to delete the remote branch. If DELETE fails (branch protection,
+# permission, API error), the branch is still safe to reuse since it carries
+# no meaningful work. Output a passthrough marker so the caller allows
+# dispatch instead of feeding the no_work circuit breaker (GH#1214).
+#
 # Args: $1 issue, $2 repo, $3 branch, $4 remote probe, $5 commit count,
 #       $6 comments endpoint, $7 comments json
-# Returns: 0 if recovered, 1 if caller should keep normal hold/block logic
+# Returns: 0 if recovered or safe to pass through (zero commits, no PR),
+#          1 if caller should keep normal hold/block logic (PR exists)
 #######################################
 _ddh_auto_recover_zero_commit_orphan_branch() {
 	local issue_number="$1"
@@ -270,7 +277,14 @@ _ddh_auto_recover_zero_commit_orphan_branch() {
 		return 0
 	fi
 
-	return 1
+	# GH#1214: DELETE failed (branch protection, permission, or API error),
+	# but the branch has zero commits and no PR — it is functionally empty
+	# and safe to reuse. Let dispatch proceed instead of blocking with
+	# UNRECOVERABLE_BLOCKED, which would feed the no_work circuit breaker
+	# loop via stale-recovery → fast-fail → t2769 trip.
+	printf 'WORKER_BRANCH_ORPHAN_ZERO_COMMIT_PASSTHROUGH (issue=%s repo=%s branch=%s reason=zero_commits_delete_failed remote_probe=%s commit_count=%s)\n' \
+		"$issue_number" "$repo_slug" "$branch_name" "$remote_probe" "$commit_count"
+	return 0
 }
 
 #######################################
@@ -1120,7 +1134,7 @@ _ddh_count_orphan_marker_prefix() {
 #
 # Args: $1 issue, $2 repo, $3 branch, $4 worktree path, $5 base branch,
 #       $6 comments endpoint, $7 comments JSON
-# Returns: 0 if dispatch was held, 1 otherwise
+# Returns: 0 if dispatch was held, 1 otherwise (including auto-recovered)
 #######################################
 _ddh_hold_unrecoverable_orphan_branch_if_needed() {
 	local issue_number="$1"
@@ -1146,8 +1160,14 @@ _ddh_hold_unrecoverable_orphan_branch_if_needed() {
 	if [[ "$commit_count" == "0" ]]; then
 		if _ddh_auto_recover_zero_commit_orphan_branch "$issue_number" "$repo_slug" "$branch_name" \
 			"$remote_probe" "$commit_count" "$comments_post_endpoint" "$comments_json"; then
-			return 0
+			# GH#1214: auto-recovery succeeded (branch deleted or safe to
+			# reuse). Return 1 (not held) so dispatch proceeds. The caller
+			# in _dlw_check_worker_branch_orphan_loop also checks stdout
+			# for WORKER_BRANCH_ORPHAN_AUTO_RECOVERED / _ZERO_COMMIT_PASSTHROUGH
+			# as a secondary dispatch gate.
+			return 1
 		fi
+		# PR exists for this zero-commit branch — hold as before.
 		_ddh_hold_unrecoverable_orphan_branch "$issue_number" "$repo_slug" "$branch_name" \
 			"zero_commits" "$remote_probe" "$remote_exists" "$commit_count" \
 			"$comments_post_endpoint" "$comments_json"

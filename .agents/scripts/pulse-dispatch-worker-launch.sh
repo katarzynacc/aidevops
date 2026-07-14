@@ -1860,7 +1860,11 @@ _dlw_check_worker_branch_orphan_loop() {
 
 	local orphan_loop_out=""
 	if orphan_loop_out=$("$dedup_helper" check-orphan-loop "$issue_number" "$repo_slug" "$worker_worktree_branch" "$todo_file" "$worker_worktree_path" 2>/dev/null); then
-		if [[ "$orphan_loop_out" == *"WORKER_BRANCH_ORPHAN_AUTO_RECOVERED"* ]]; then
+		# GH#1214: also accept ZERO_COMMIT_PASSTHROUGH — the branch has no
+		# commits and no PR, so it is safe to reuse even when the remote
+		# DELETE failed (branch protection, permission, API error).
+		if [[ "$orphan_loop_out" == *"WORKER_BRANCH_ORPHAN_AUTO_RECOVERED"* ]] || \
+		   [[ "$orphan_loop_out" == *"WORKER_BRANCH_ORPHAN_ZERO_COMMIT_PASSTHROUGH"* ]]; then
 			echo "[dispatch_with_dedup] Auto-recovered orphan branch for #${issue_number} in ${repo_slug}: ${orphan_loop_out}" >>"$LOGFILE"
 			return 1
 		fi
