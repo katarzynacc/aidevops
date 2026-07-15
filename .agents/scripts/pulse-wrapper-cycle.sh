@@ -144,6 +144,18 @@ _pulse_refresh_repo() {
 		return 0
 	fi
 
+	# GH#2698: resolve default_branch here — it is local to
+	# _pulse_refresh_should_skip_repo and is not visible in this scope.
+	# _pulse_refresh_should_skip_repo already verified that the branch is
+	# set and the repo is on it, so this lookup cannot return empty.
+	local default_branch=""
+	if declare -F _get_default_branch_for_repo >/dev/null 2>&1; then
+		default_branch=$(_get_default_branch_for_repo "$repo_path" 2>/dev/null) || default_branch=""
+	else
+		default_branch=$(git -C "$repo_path" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null) || default_branch=""
+		default_branch="${default_branch#origin/}"
+	fi
+
 	local remote_sha="" local_sha=""
 	remote_sha=$(git -C "$repo_path" ls-remote origin "refs/heads/${default_branch}" 2>/dev/null | awk 'NR == 1 {print $1}') || remote_sha=""
 	local_sha=$(git -C "$repo_path" rev-parse HEAD 2>/dev/null || true)
