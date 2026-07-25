@@ -169,6 +169,10 @@ assert_rc "1.7 missing stats file returns 0" "0" "$rc"
 echo ""
 echo "--- Section 2: process-count-anomaly ---"
 
+# Sub-section 2a: fallback path (PS_OUTPUT_OVERRIDE set — test mode).
+# This path uses raw grep count, as before. Tests are unchanged.
+echo "  [2a: fallback raw-grep path via PS_OUTPUT_OVERRIDE]"
+
 PS_FIRING=$(printf '%s\n' \
 	"  101 /bin/bash /Users/x/.aidevops/agents/scripts/pulse-wrapper.sh" \
 	"  102 /bin/bash /Users/x/.aidevops/agents/scripts/pulse-wrapper.sh" \
@@ -187,16 +191,79 @@ assert_contains "2.2 firing body has correct id" '"id": "process-count-anomaly"'
 assert_contains "2.3 firing title cites count" "count anomaly (6 > 3)" "$out"
 assert_contains "2.4 firing body has marker" 'detector=process-count-anomaly' "$out"
 
-# Clean fixture: 2 matches, threshold 5 → no-op
+# Clean fixture: 2 matches, threshold 15 (new default) → no-op
 PS_CLEAN=$(printf '%s\n' \
 	"  101 /bin/bash /Users/x/.aidevops/agents/scripts/pulse-wrapper.sh" \
 	"  102 /bin/bash /Users/x/.aidevops/agents/scripts/pulse-wrapper.sh")
 out=$(_run_detector "$RULES_DIR/process-count-anomaly.sh" \
 	"PS_OUTPUT_OVERRIDE=$PS_CLEAN" \
-	"LEAK_THRESHOLD=5" \
+	"LEAK_THRESHOLD=15" \
 	"PROC_PATTERN=pulse-wrapper.sh") && rc=0 || rc=$?
 assert_rc "2.5 below-threshold fixture returns 0" "0" "$rc"
 assert_empty "2.6 below-threshold emits no output" "$out"
+
+# Sub-section 2b: primary path (LIFECYCLE_HELPER_OVERRIDE — no PS_OUTPUT_OVERRIDE).
+# The primary path delegates to pulse-lifecycle-helper.sh and fires on exit code 3.
+echo "  [2b: primary lifecycle-helper path via LIFECYCLE_HELPER_OVERRIDE]"
+
+# Create a mock lifecycle helper that exits 3 (pile-up) and emits a status block.
+FAKE_LIFECYCLE_PILEUP="$TMPDIR_TEST/fake-lifecycle-pileup.sh"
+cat >"$FAKE_LIFECYCLE_PILEUP" <<'EOF'
+#!/usr/bin/env bash
+printf 'Pulse: running (5 instances)\n'
+printf '  PID 101 (lock holder) (uptime 05:00)\n'
+printf '  PID 102 (uptime 04:50)\n'
+printf '  PID 103 (uptime 04:40)\n'
+printf '  PID 104 (uptime 04:30)\n'
+printf '  PID 105 (uptime 04:20)\n'
+exit 3
+EOF
+chmod +x "$FAKE_LIFECYCLE_PILEUP"
+
+out=$(_run_detector "$RULES_DIR/process-count-anomaly.sh" \
+	"LIFECYCLE_HELPER_OVERRIDE=$FAKE_LIFECYCLE_PILEUP") && rc=0 || rc=$?
+assert_rc "2.7 lifecycle pile-up fixture returns 1" "1" "$rc"
+assert_contains "2.8 lifecycle firing body has correct id" '"id": "process-count-anomaly"' "$out"
+assert_contains "2.9 lifecycle firing title cites pile-up" "MAIN process pile-up" "$out"
+assert_contains "2.10 lifecycle firing body has marker" 'detector=process-count-anomaly' "$out"
+assert_contains "2.11 lifecycle firing body mentions PPID filtering" "PPID-based" "$out"
+
+# Mock lifecycle helper that exits 0 (healthy) → no-op
+FAKE_LIFECYCLE_OK="$TMPDIR_TEST/fake-lifecycle-ok.sh"
+cat >"$FAKE_LIFECYCLE_OK" <<'EOF'
+#!/usr/bin/env bash
+printf 'Pulse: running (1 instance)\n'
+printf '  PID 101 (lock holder) (uptime 02:00)\n'
+exit 0
+EOF
+chmod +x "$FAKE_LIFECYCLE_OK"
+
+out=$(_run_detector "$RULES_DIR/process-count-anomaly.sh" \
+	"LIFECYCLE_HELPER_OVERRIDE=$FAKE_LIFECYCLE_OK") && rc=0 || rc=$?
+assert_rc "2.12 lifecycle healthy fixture returns 0" "0" "$rc"
+assert_empty "2.13 lifecycle healthy fixture emits no output" "$out"
+
+# Mock lifecycle helper that exits 1 (not-running) → no-op (pulse off, not a pile-up)
+FAKE_LIFECYCLE_OFF="$TMPDIR_TEST/fake-lifecycle-off.sh"
+cat >"$FAKE_LIFECYCLE_OFF" <<'EOF'
+#!/usr/bin/env bash
+printf 'Pulse: not running\n'
+exit 1
+EOF
+chmod +x "$FAKE_LIFECYCLE_OFF"
+
+out=$(_run_detector "$RULES_DIR/process-count-anomaly.sh" \
+	"LIFECYCLE_HELPER_OVERRIDE=$FAKE_LIFECYCLE_OFF") && rc=0 || rc=$?
+assert_rc "2.14 lifecycle not-running fixture returns 0" "0" "$rc"
+assert_empty "2.15 lifecycle not-running fixture emits no output" "$out"
+
+# Fallback to raw grep when lifecycle helper is missing (LIFECYCLE_HELPER_OVERRIDE
+# points to non-existent file) and PS_OUTPUT_OVERRIDE is NOT set.
+# Use a very high threshold so the real ps output does not fire.
+out=$(_run_detector "$RULES_DIR/process-count-anomaly.sh" \
+	"LIFECYCLE_HELPER_OVERRIDE=/nonexistent/path/lifecycle-helper.sh" \
+	"LEAK_THRESHOLD=9999") && rc=0 || rc=$?
+assert_rc "2.16 missing lifecycle helper falls back to raw grep (no fire)" "0" "$rc"
 
 # ---------------------------------------------------------------------------
 # Test 3: deployed-vs-source-mtime-drift
