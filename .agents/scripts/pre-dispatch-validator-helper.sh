@@ -1137,6 +1137,27 @@ _rf_get_routed_review_at() {
 		return 0
 	fi
 
+	# SHA-exact pass found no CHANGES_REQUESTED review. This happens when a worker
+	# pushes additional commits (CI fixes) after the reviewer submitted
+	# CHANGES_REQUESTED — the feedback-route records the new HEAD SHA but the review
+	# is attached to an earlier commit. Fall back to the most recent CHANGES_REQUESTED
+	# on any commit: the timestamp still establishes the correct dispatch window even
+	# when the HEAD SHA has advanced beyond the reviewed commit.
+	if [[ -n "$source_sha" ]]; then
+		while IFS=$'\t' read -r review_state submitted_at commit_id; do
+			[[ "$review_state" == "CHANGES_REQUESTED" ]] || continue
+			[[ "$submitted_at" == *T* ]] || continue
+			if [[ -z "$latest" || "$submitted_at" > "$latest" ]]; then
+				latest="$submitted_at"
+			fi
+		done <<<"$review_rows"
+	fi
+
+	if [[ -n "$latest" ]]; then
+		printf '%s\n' "$latest"
+		return 0
+	fi
+
 	return 1
 }
 
